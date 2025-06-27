@@ -1,31 +1,122 @@
-import { initializeParams } from './helpers/init';
-import { VLOverWSHandler } from './protocols/vless';
-import { TROverWSHandler } from './protocols/trojan';
-import { fallback, serveIcon, renderError, renderSecrets, handlePanel, handleSubscriptions, handleLogin, handleError } from './helpers/helpers';
-import { logout } from './authentication/auth';
+import { readFileSync, writeFileSync, mkdirSync } from 'fs';
+import { join, dirname as pathDirname } from 'path';
+import { fileURLToPath } from 'url';
+import { build } from 'esbuild';
+import { globSync } from 'glob';
+import { minify as jsMinify } from 'terser';
+import { minify as htmlMinify } from 'html-minifier';
+import JSZip from "jszip";
+import obfs from 'javascript-obfuscator';
 
-export default {
-	async fetch(request, env) {
-		try {
-			initializeParams(request, env);
-			const upgradeHeader = request.headers.get('Upgrade');
-			const path = globalThis.pathName;
-			if (!upgradeHeader || upgradeHeader !== 'websocket') {
-				if (path.startsWith('/panel')) return await handlePanel(request, env);
-				if (path.startsWith('/sub')) return await handleSubscriptions(request, env);
-				if (path.startsWith('/login')) return await handleLogin(request, env);
-				if (path.startsWith('/logout')) return await logout(request, env);
-				if (path.startsWith('/error')) return await renderError();
-				if (path.startsWith('/secrets')) return await renderSecrets();
-				if (path.startsWith('/favicon.ico')) return await serveIcon();
-				return await fallback(request);
-			} else {
-				return path.startsWith('/tr')
-					? await TROverWSHandler(request)
-					: await VLOverWSHandler(request);
-			}
-		} catch (error) {
-			return await handleError(error);
-		}
-	}
+const env = process.env.NODE_ENV || 'production';
+const devMode = env !== 'production';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = pathDirname(__filename);
+
+const ASSET_PATH = join(__dirname, '../src/assets');
+const DIST_PATH = join(__dirname, '../dist/');
+
+async function processHtmlPages() {
+    const indexFiles = globSync('**/index.html', { cwd: ASSET_PATH });
+    const result = {};
+
+    for (const relativeIndexPath of indexFiles) {
+        const dir = pathDirname(relativeIndexPath);
+        const base = (file) => join(ASSET_PATH, dir, file);
+
+        const indexHtml = readFileSync(base('index.html'), 'utf8');
+        const styleCode = readFileSync(base('style.css'), 'utf8');
+        const scriptCode = readFileSync(base('script.js'), 'utf8');
+
+        const finalScriptCode = await jsMinify(scriptCode);
+        const finalHtml = indexHtml
+            .replace(/__STYLE__/g, `<style>${styleCode}</style>`)
+            .replace(/__SCRIPT__/g, finalScriptCode.code);
+
+        const minifiedHtml = htmlMinify(finalHtml, {
+            collapseWhitespace: true,
+            removeAttributeQuotes: true,
+            minifyCSS: true
+        });
+
+        result[dir] = JSON.stringify(minifiedHtml);
+    }
+
+    console.log('✅ Assets bundled successfuly!');
+    return result;
 }
+
+async function buildWorker() {
+
+    const htmls = await processHtmlPages();
+    const faviconBuffer = readFileSync('./src/assets/favicon.ico');
+    const faviconBase64 = faviconBuffer.toString('base64');
+
+    const code = await build({
+        entryPoints: [join(__dirname, '../src/worker.js')],
+        bundle: true,
+        format: 'esm',
+        write: false,
+        external: ['cloudflare:sockets'],
+        platform: 'browser',
+        target: 'es2020',
+        define: {
+            __PANEL_HTML_CONTENT__: htmls['panel'] ?? '""',
+            __LOGIN_HTML_CONTENT__: htmls['login'] ?? '""',
+            __ERROR_HTML_CONTENT__: htmls['error'] ?? '""',
+            __SECRETS_HTML_CONTENT__: htmls['secrets'] ?? '""',
+            __ICON__: JSON.stringify(faviconBase64)
+        }
+    });
+    
+    console.log('✅ Worker built successfuly!');
+
+    let finalCode;
+    if (devMode) {
+        finalCode = code.outputFiles[0].text;
+    } else {
+        const minifiedCode = await jsMinify(code.outputFiles[0].text, {
+            module: true,
+            output: {
+                comments: false
+            }
+        });
+    
+        console.log('✅ Worker minified successfuly!');
+    
+        const obfuscationResult = obfs.obfuscate(minifiedCode.code, {
+            stringArrayThreshold: 1,
+            stringArrayEncoding: [
+                "rc4"
+            ],
+            numbersToExpressions: true,
+            transformObjectKeys: true,
+            renameGlobals: true,
+            deadCodeInjection: true,
+            deadCodeInjectionThreshold: 0.2,
+            target: "browser"
+        });
+    
+        console.log('✅ Worker obfuscated successfuly!');
+        finalCode = obfuscationResult.getObfuscatedCode();
+    }
+
+    const worker = `// @ts-nocheck\n${finalCode}`;
+    mkdirSync(DIST_PATH, { recursive: true });
+    writeFileSync('./dist/worker.js', worker, 'utf8');
+
+    const zip = new JSZip();
+    zip.file('_worker.js', worker);
+    zip.generateAsync({
+        type: 'nodebuffer',
+        compression: 'DEFLATE'
+    }).then(nodebuffer => writeFileSync('./dist/worker.zip', nodebuffer));
+
+    console.log('✅ Done!');
+}
+
+buildWorker().catch(err => {
+    console.error('❌ Build failed:', err);
+    process.exit(1);
+});
